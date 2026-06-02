@@ -7,7 +7,6 @@ name: Docker
 #   cuda     — NVIDIA CUDA runtime baked in
 #   vulkan   — vendor-neutral GPU via Vulkan
 #   rocm     — AMD ROCm runtime (linux/amd64 only — upstream has no arm64 build)
-#   jetson   — NVIDIA Jetson L4T base (linux/arm64 only, --target=runtime-jetson)
 #   all      — bundles cpu+cuda+vulkan+rocm into a single image
 #
 # Every variant also bakes in matching whisper.cpp (bucky) shared libraries
@@ -21,7 +20,7 @@ name: Docker
 # `ubuntu-24.04` (amd64) and `ubuntu-24.04-arm` (arm64) runners, then
 # stitched into a single manifest with `docker buildx imagetools create`.
 # This avoids the ~5x slowdown of QEMU emulation for arm64 builds. Rocm
-# and jetson skip the manifest merge step because they're single-arch.
+# skips the manifest merge step because they're single-arch.
 #
 # ┌────────────────────┬─────────────────────────────────────────────────────┐
 # │ Event              │ Behaviour                                           │
@@ -180,8 +179,7 @@ jobs:
             [all]=runtime
           )
           # Whitespace-separated processor lists fed to LLAMA_PROCESSORS in
-          # the Dockerfile. The "all" variant intentionally omits jetson
-          # because Jetson uses a different runtime base image entirely.
+          # the Dockerfile.
           declare -A PROCESSORS=(
             [cpu]="cpu"
             [cuda]="cuda"
@@ -403,12 +401,31 @@ jobs:
       # Push event path: build & push by digest only. Final tags get
       # applied by the `merge` job once both arches are available.
       #
-      # `image-manifest=true` writes the cache as an OCI image manifest
-      # (rather than the default OCI image index) so GHCR's UI renders
-      # the tags as proper packages instead of unknown artifacts.
-      - name: Build & push by digest
+      # GHCR and Docker Hub are pushed in SEPARATE buildx invocations
+      # on purpose. A single invocation with two `outputs:` lines pushes
+      # different index-manifest digests to each registry (each
+      # provenance attestation embeds the destination registry name),
+      # but `steps.build.outputs.digest` only surfaces one of them —
+      # so the `merge` job's cross-registry refs become unresolvable
+      # ("manifest unknown" against one of the two registries).
+      #
+      # Splitting the pushes:
+      #   * gives each step its own `outputs.digest` (one per registry,
+      #     no ambiguity to track in the merge job);
+      #   * preserves provenance attestations on both registries,
+      #     each correctly naming its own canonical reference;
+      #   * costs almost nothing — the second buildx call hits the
+      #     registry-backed BuildKit cache populated by the first and
+      #     only re-pushes layers to the second registry.
+      #
+      # `image-manifest=true` on the cache export writes it as an OCI
+      # image manifest (rather than the default OCI image index) so
+      # GHCR's UI renders the buildcache tags as proper packages
+      # instead of unknown artifacts. Only the GHCR step writes the
+      # cache; the DH step reads from it.
+      - name: Build & push by digest to GHCR
         if: needs.plan.outputs.push == 'true'
-        id: build
+        id: build_ghcr
         uses: docker/build-push-action@v7
         with:
           context: .
@@ -419,27 +436,56 @@ jobs:
             LLAMA_PROCESSORS=${{ matrix.processors }}
             BUCKY_PROCESSORS=${{ matrix.bucky_processors }}
             KRONK_VERSION=${{ needs.plan.outputs.version }}-${{ matrix.variant }}
-          outputs: |
-            type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
-            type=image,name=${{ env.DH_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          outputs: type=image,name=${{ env.GHCR_IMAGE }},push-by-digest=true,name-canonical=true,push=true
           cache-from: type=registry,ref=${{ env.BUILDCACHE_IMAGE }}:${{ matrix.variant }}-${{ matrix.arch }}
           cache-to: type=registry,ref=${{ env.BUILDCACHE_IMAGE }}:${{ matrix.variant }}-${{ matrix.arch }},mode=max,image-manifest=true,compression=zstd
 
-      - name: Export digest
+      - name: Build & push by digest to Docker Hub
+        if: needs.plan.outputs.push == 'true'
+        id: build_dh
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: zarf/docker/kronk/Dockerfile
+          platforms: ${{ matrix.platform }}
+          target: ${{ matrix.target }}
+          build-args: |
+            LLAMA_PROCESSORS=${{ matrix.processors }}
+            BUCKY_PROCESSORS=${{ matrix.bucky_processors }}
+            KRONK_VERSION=${{ needs.plan.outputs.version }}-${{ matrix.variant }}
+          outputs: type=image,name=${{ env.DH_IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          # cache-from only: the GHCR step above already populated the
+          # cache for this (variant, arch); a second cache-to would
+          # just rewrite the same content.
+          cache-from: type=registry,ref=${{ env.BUILDCACHE_IMAGE }}:${{ matrix.variant }}-${{ matrix.arch }}
+
+      - name: Export digests
         if: needs.plan.outputs.push == 'true'
         run: |
-          mkdir -p /tmp/digests
-          digest='${{ steps.build.outputs.digest }}'
-          # Use the bare hex part as the filename so the merge job can
-          # reconstruct `<image>@sha256:<digest>` references unambiguously.
-          touch "/tmp/digests/${digest#sha256:}"
+          # One file per registry, named with the bare hex of the digest
+          # so the merge job can reconstruct `<image>@sha256:<digest>`
+          # references unambiguously.
+          mkdir -p /tmp/digests/ghcr /tmp/digests/dh
+          d_ghcr='${{ steps.build_ghcr.outputs.digest }}'
+          d_dh='${{ steps.build_dh.outputs.digest }}'
+          touch "/tmp/digests/ghcr/${d_ghcr#sha256:}"
+          touch "/tmp/digests/dh/${d_dh#sha256:}"
 
-      - name: Upload digest
+      - name: Upload GHCR digest
         if: needs.plan.outputs.push == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: digests-${{ matrix.variant }}-${{ matrix.arch }}
-          path: /tmp/digests/*
+          name: digests-ghcr-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests/ghcr/*
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Docker Hub digest
+        if: needs.plan.outputs.push == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: digests-dh-${{ matrix.variant }}-${{ matrix.arch }}
+          path: /tmp/digests/dh/*
           if-no-files-found: error
           retention-days: 1
 
@@ -448,7 +494,7 @@ jobs:
   #
   # Per-variant: assemble the multi-arch manifest from the per-arch digests
   # uploaded by `build`, and apply the human-readable tags. Single-arch
-  # variants (rocm, jetson) still go through here — `imagetools create`
+  # variants (rocm) still go through here — `imagetools create`
   # happily wraps a single platform.
   # ---------------------------------------------------------------------------
   merge:
@@ -463,11 +509,17 @@ jobs:
       contents: read
       packages: write
     steps:
-      - name: Download digests for this variant
+      - name: Download GHCR digests for this variant
         uses: actions/download-artifact@v8
         with:
-          path: /tmp/digests
-          pattern: digests-${{ matrix.variant }}-*
+          path: /tmp/digests/ghcr
+          pattern: digests-ghcr-${{ matrix.variant }}-*
+
+      - name: Download Docker Hub digests for this variant
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests/dh
+          pattern: digests-dh-${{ matrix.variant }}-*
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
@@ -493,23 +545,32 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Build the list of per-arch digest references for both
-          # registries. The artifact layout is
-          # /tmp/digests/digests-<variant>-<arch>/<hexdigest>.
-          GHCR_REFS=()
-          DH_REFS=()
-          for dir in /tmp/digests/digests-"${VARIANT}"-*; do
-            [[ -d "$dir" ]] || continue
-            for f in "$dir"/*; do
-              [[ -e "$f" ]] || continue
-              d=$(basename "$f")
-              GHCR_REFS+=("${GHCR_IMAGE}@sha256:${d}")
-              DH_REFS+=("${DH_IMAGE}@sha256:${d}")
+          # Build per-registry lists of per-arch digest references. Each
+          # registry was pushed to in its own buildx invocation (see the
+          # `build` job), so the digests are different per registry —
+          # the artifacts are split accordingly:
+          #   /tmp/digests/ghcr/digests-ghcr-<variant>-<arch>/<hexdigest>
+          #   /tmp/digests/dh/digests-dh-<variant>-<arch>/<hexdigest>
+          collect_refs() {
+            local root="$1" image="$2" pattern="$3"
+            local refs=()
+            local dir f d
+            for dir in "$root"/$pattern; do
+              [[ -d "$dir" ]] || continue
+              for f in "$dir"/*; do
+                [[ -e "$f" ]] || continue
+                d=$(basename "$f")
+                refs+=("${image}@sha256:${d}")
+              done
             done
-          done
+            printf '%s\n' "${refs[@]}"
+          }
 
-          if [[ ${#GHCR_REFS[@]} -eq 0 ]]; then
-            echo "::error::No digests found for variant=${VARIANT}"
+          mapfile -t GHCR_REFS < <(collect_refs /tmp/digests/ghcr "$GHCR_IMAGE" "digests-ghcr-${VARIANT}-*")
+          mapfile -t DH_REFS   < <(collect_refs /tmp/digests/dh   "$DH_IMAGE"   "digests-dh-${VARIANT}-*")
+
+          if [[ ${#GHCR_REFS[@]} -eq 0 || ${#DH_REFS[@]} -eq 0 ]]; then
+            echo "::error::No digests found for variant=${VARIANT} (ghcr=${#GHCR_REFS[@]}, dh=${#DH_REFS[@]})"
             exit 1
           fi
 
