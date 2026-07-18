@@ -286,10 +286,15 @@ docker run --rm \
     ghcr.io/ardanlabs/kronk:latest
 ```
 
-NVIDIA GPU (requires `nvidia-container-toolkit` on the host):
+NVIDIA GPU (requires `nvidia-container-toolkit` on the host). Pass
+`--runtime=nvidia` unless the NVIDIA runtime is already the default in
+`/etc/docker/daemon.json`. The CUDA runtime libraries (libcudart,
+libcublas) are baked into the `:latest-cuda` image; the container runtime
+injects only the driver, so a working `nvidia-smi` inside the container
+does not by itself confirm GPU-accelerated inference:
 
 ```shell
-docker run --rm --gpus all \
+docker run --rm --runtime=nvidia --gpus all \
     -p 11435:11435 \
     -v kronk-data:/kronk \
     ghcr.io/ardanlabs/kronk:latest-cuda
@@ -544,6 +549,31 @@ kronk libs --local --upgrade
 > are reproducible. The model server takes the opposite default
 > (`--allow-upgrade=true`) so a long-running server picks up upstream
 > fixes; see Chapter 8 §8.3 for that flag.
+
+> **NVIDIA/CUDA on Linux — host runtime prerequisite.** The `cuda` bundle
+> ships `libggml-cuda.so`, which is dynamically linked against the CUDA
+> **runtime** libraries `libcudart.so.13` and `libcublas.so.13`. On Linux
+> these are **not** included in the bundle and are **not** provided by the
+> NVIDIA driver — `nvidia-smi` working only proves the driver is present.
+> They must already exist on the host, or the CUDA backend fails to load
+> and Kronk silently falls back to CPU. Most machines with the CUDA
+> toolkit installed already have them; if not, install the runtime
+> packages (no full toolkit needed):
+>
+> ```shell
+> # Ubuntu 24.04 — add NVIDIA's repo via the cuda-keyring package, then:
+> sudo apt-get install -y cuda-cudart-13-0 libcublas-13-0
+> ```
+>
+> Verify the backend can resolve its dependencies (no `not found` lines):
+>
+> ```shell
+> ldd ~/.kronk/libraries/linux/amd64/cuda/libggml-cuda.so | grep -iE 'cudart|cublas'
+> ```
+>
+> This affects **Linux only**. On Windows the CUDA runtime redistributable
+> is downloaded automatically alongside the bundle, and the `:latest-cuda`
+> Docker image bakes these libraries in.
 
 **Pinning a Specific Library Version**
 
