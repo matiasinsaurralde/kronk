@@ -27,26 +27,38 @@ type chatJob struct {
 	// -------------------------------------------------------------------------
 	// Request Content
 
-	d      D        // Original request document (messages, parameters)
-	object string   // Request type: ObjectChatText or ObjectChatMedia
-	prompt string   // Templated prompt string ready for tokenization
-	media  [][]byte // Raw media bytes (images/audio) for vision/audio models
-	params Params   // Sampling and generation parameters
+	d             D             // Original request document (messages, parameters)
+	object        string        // Request type: ObjectChatText or ObjectChatMedia
+	prompt        string        // Templated prompt string ready for tokenization
+	media         [][]byte      // Raw media bytes (images/audio) for vision/audio models
+	params        Params        // Sampling and generation parameters
+	actualTokens  []llama.Token // Complete generation-ready token sequence for token-v2 IMC.
+	tailTokens    []llama.Token // Non-empty inference tail after the stable cached target.
+	imcTokenPlan  bool          // True when actualTokens/tailTokens are authoritative.
+	imcMatchKind  string        // exact, append, or rebuild; used for diagnostics.
+	imcPromptPlan promptPlan    // Logical stable prefix committed with the session.
 
 	// -------------------------------------------------------------------------
 	// Incremental Message Cache (IMC)
 
-	imcSession      *imcSession // Matched IMC session (the session-pool entry whose KV state will be restored into the assigned slot)
-	imcSessionMedia bool        // True if session has media (snapshot at job creation; safe to read without lock)
-	imcSessionID    int         // Session-pool index (== imcSession.id); used by imcClearPending lookup and log correlation. Not related to execution slot identity.
-	imcCacheHit     bool        // True if conversation history was found in cache
-	imcExpectedHash string      // Expected cachedMsgsHash for stale detection at startSlot (a concurrent extend may have moved the session forward between processIMC and startSlot)
+	imcSession        *imcSession // Matched IMC session (the session-pool entry whose KV state will be restored into the assigned slot)
+	imcSessionMedia   bool        // True if session has media (snapshot at job creation; safe to read without lock)
+	imcSessionID      int         // Session-pool index (== imcSession.id); used by imcClearPending lookup and log correlation. Not related to execution slot identity.
+	imcCacheHit       bool        // True when this request uses the IMC build/restore path.
+	imcSnapshotReused bool        // True after a prior externalized target snapshot is restored successfully.
+	imcExpectedHash   string      // Expected cachedMsgsHash for stale detection at startSlot (a concurrent extend may have moved the session forward between processIMC and startSlot)
 
 	// Pure-hit snapshot-skip state mirrored from cacheResult.
 	imcExpectedCachedMsgs  int    // Expected cachedMsgCount at startSlot.
-	imcExpectedTokens      int    // Expected totalTokensCached at startSlot.
+	imcExpectedTokens      int    // Expected physical KV cells at startSlot.
+	imcExpectedPosition    int    // Expected next logical position at startSlot.
 	imcExpectedRenderHash  string // Expected cachedRenderInputHash at startSlot (carried forward on builds/extends so commit can refresh the session field).
-	imcPureHitSkipSnapshot bool   // True when startSlot may skip the post-restore snapshot.
+	imcExpectedPromptPlan  promptPlan
+	imcReadOnlyReservation bool // True when the session is reserved for restore/use without metadata or snapshot mutation.
+	imcMediaAnchorAdvance  bool // True when text after a media anchor should be atomically committed as a larger snapshot.
+	imcNewLogicalPosition  int  // Next logical position after a media-anchor advance.
+	imcReservationHeld     bool // True until this request publishes or releases its reservation.
+	imcPureHitSkipSnapshot bool // True when startSlot may skip the post-restore snapshot.
 
 	// IMC dedicated slot fields.
 	imcNewCacheTokens    []llama.Token // New tokens to extend the cache in the slot's sequence
@@ -64,6 +76,10 @@ type chatJob struct {
 	imcMediaCacheD         D     // Document with cacheable messages + tools for media cache build
 	imcMediaKVCounts       []int // Media KV position counts to preserve during text-only media extend
 	imcMediaSkipTextTokens int   // Text tokens already in KV cache to skip during partial media extend
+}
+
+func (j *chatJob) hasIMCReservation() bool {
+	return j != nil && j.imcSession != nil && j.imcReservationHeld
 }
 
 // slot represents a processing slot for parallel inference. Each slot can
@@ -137,18 +153,20 @@ type slot struct {
 	// -------------------------------------------------------------------------
 	// Speculative Decoding
 
-	draftNPast         llama.Pos     // Draft model's KV cache position
-	draftPrefillNeeded bool          // True when draft model needs prefill after target prefill
-	draftPromptTokens  []llama.Token // Full prompt tokens for draft model prefill
-	specDraftTokens    []llama.Token // Draft tokens for current speculative step
-	specDraftProbs     [][]float32   // Draft probability distributions per drafted token
-	specBasePast       llama.Pos     // Target nPast before speculative tokens were added
-	specBaseBatch      int32         // Batch index where speculative tokens start
-	specDraftedTotal   int           // Total draft tokens generated across all speculative steps
-	specAcceptedTotal  int           // Total draft tokens accepted across all speculative steps
-	specAccEMA         float64       // Exponential moving average of acceptance rate (persists across requests)
-	specRounds         int           // Verify rounds completed this request (used to throttle per-round logging)
-	mtpProbeTick       int           // Counts decode rounds spent fully throttled (EMA < floor); drives the periodic recovery probe in chooseNDraft. Persists across requests.
+	draftNPast          llama.Pos     // Draft model's KV cache position
+	draftPrefillNeeded  bool          // True when draft model needs prefill after target prefill
+	draftPromptTokens   []llama.Token // Full prompt tokens for draft model prefill
+	specDraftTokens     []llama.Token // Draft tokens for current speculative step
+	specDraftProbs      [][]float32   // Draft probability distributions per drafted token
+	specBasePast        llama.Pos     // Target nPast before speculative tokens were added
+	specBaseBatch       int32         // Batch index where speculative tokens start
+	specDraftedTotal    int           // Total draft tokens generated across all speculative steps
+	specAcceptedTotal   int           // Total draft tokens accepted across all speculative steps
+	specCoveredTotal    int           // Emitted output tokens processed through speculative verification
+	processingSpecToken bool          // True while an accepted draft or bonus token is being processed
+	specAccEMA          float64       // Exponential moving average of acceptance rate (persists across requests)
+	specRounds          int           // Verify rounds completed this request (used to throttle per-round logging)
+	mtpProbeTick        int           // Counts decode rounds spent fully throttled (EMA < floor); drives the periodic recovery probe in chooseNDraft. Persists across requests.
 
 	// Per-slot owned buffers for speculative decoding. Avoids shared buffer
 	// corruption when multiple slots generate draft tokens in the same
@@ -194,14 +212,10 @@ type slot struct {
 	// mirror step.
 	mtpHasBatch bool
 
-	// mtpDisabledForRequest is set true at startSlot when the request
-	// hit IMC cache. MTP requires the draft KV to track the entire
-	// sequence to make useful proposals, but IMC restores ONLY the
-	// target KV — there is no draft snapshot. Running MTP against an
-	// empty (or partial) draft context produces near-zero acceptance
-	// for the whole request, which is worse than no speculation.
-	// Also set inside finalizeSpeculativeTokens after a post-rollback
-	// mirror failure. Cleared in slot.reset().
+	// mtpDisabledForRequest is set when own-KV draft state cannot resume
+	// alongside an IMC-restored target, or after a post-rollback mirror
+	// failure. Shared-KV Gemma4 resumes from the target state directly.
+	// Cleared in slot.reset().
 	mtpDisabledForRequest bool
 
 	// mtpDisableReason is a short, machine-friendly label describing
@@ -211,9 +225,11 @@ type slot struct {
 	// a request with a high DMAR also had low draft coverage. Empty
 	// while MTP is still active. Cleared in slot.reset(). Possible
 	// values mirror the speculative-log status names:
-	//   "imc-hit"      — IMC cache hit at startSlot.
+	//   "imc-hit"      — IMC cache hit lacked restorable draft state.
+	//   "media-mrope"  — M-RoPE media state cannot resume the draft safely.
 	//   "mirror-error" — post-verify mirror failed; draft KV wiped.
 	mtpDisableReason string
+	mtpResumeSource  string
 
 	// verifyH is a slot-local cache of the target context's pre-norm
 	// hidden-state rows for the slot's just-decoded spec batch range.
@@ -320,6 +336,8 @@ func (s *slot) reset() {
 	s.specBaseBatch = 0
 	s.specDraftedTotal = 0
 	s.specAcceptedTotal = 0
+	s.specCoveredTotal = 0
+	s.processingSpecToken = false
 	s.specRounds = 0
 	s.specPendingFinalize = false
 	s.specPendingAccepted = 0
@@ -341,6 +359,7 @@ func (s *slot) reset() {
 	s.mtpHasBatch = false
 	s.mtpDisabledForRequest = false
 	s.mtpDisableReason = ""
+	s.mtpResumeSource = ""
 	if s.draftSampler != 0 {
 		llama.SamplerFree(s.draftSampler)
 		s.draftSampler = 0

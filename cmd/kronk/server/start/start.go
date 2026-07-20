@@ -117,6 +117,22 @@ func buildEnvVars(cmd *cobra.Command) []string {
 		envVars = append(envVars, "KRONK_WEB_ADMIN_PASSWORD_SHA256="+v)
 	}
 
+	// MCP settings
+	if cmd.Flags().Changed("mcp-enabled") {
+		v, _ := cmd.Flags().GetBool("mcp-enabled")
+		envVars = append(envVars, "KRONK_MCP_ENABLED="+strconv.FormatBool(v))
+	}
+	if v, _ := cmd.Flags().GetString("mcp-host"); v != "" {
+		envVars = append(envVars, "KRONK_MCP_HOST="+v)
+	}
+	if cmd.Flags().Changed("mcp-auth-enabled") {
+		v, _ := cmd.Flags().GetBool("mcp-auth-enabled")
+		envVars = append(envVars, "KRONK_MCP_AUTH_ENABLED="+strconv.FormatBool(v))
+	}
+	if v, _ := cmd.Flags().GetString("mcp-brave-api-key"); v != "" {
+		envVars = append(envVars, "KRONK_MCP_BRAVE_API_KEY="+v)
+	}
+
 	// Tempo/tracing settings
 	if v, _ := cmd.Flags().GetString("tempo-host"); v != "" {
 		envVars = append(envVars, "KRONK_TEMPO_HOST="+v)

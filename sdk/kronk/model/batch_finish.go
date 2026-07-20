@@ -26,6 +26,13 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 	slotID := s.id
 	seqID := s.seqID
 	nPrompt := s.nPrompt
+	imcTokenPlan := s.job.imcTokenPlan
+	imcMatchKind := s.job.imcMatchKind
+	imcSessionID := s.job.imcSessionID
+	imcActive := s.job.imcCacheHit
+	imcSnapshotReused := s.job.imcSnapshotReused
+	imcTailTokens := len(s.job.tailTokens)
+	mtpResumeSource := s.mtpResumeSource
 
 	var elapsed time.Duration
 
@@ -46,10 +53,7 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 		outputTokens := s.reasonTokens + s.completionTokens
 		draftTokens := s.specDraftedTotal
 		draftAcceptedTokens := s.specAcceptedTotal
-		// Coverage = (1 bonus per spec round) + accepted drafts. Each
-		// spec round emits one bonus token plus its accepted drafts;
-		// every other output token came from the plain target path.
-		draftCoveredTokens := s.specRounds + draftAcceptedTokens
+		draftCoveredTokens := s.specCoveredTotal
 		disableReason := s.mtpDisableReason
 
 		s.span.End()
@@ -66,6 +70,7 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 		// same reason. Note: s.reset() above sets s.job = nil, so we
 		// must close via the locally captured jobCh, not s.job.ch.
 		remaining := e.model.activeStreams.Add(-1)
+		metrics.AddPoolActiveStreams(e.model.modelInfo.ID, -1)
 		close(jobCh)
 
 		args := []any{
@@ -75,6 +80,17 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 			"id", jobID,
 			"total_prompt", nPrompt,
 			"output_tokens", outputTokens,
+			"imc_cache_mode", func() string {
+				if imcTokenPlan {
+					return "token-v2"
+				}
+				return "legacy"
+			}(),
+			"imc_slot", imcSessionID,
+			"imc_active", imcActive,
+			"imc_cache_hit", imcSnapshotReused,
+			"imc_match_kind", imcMatchKind,
+			"imc_tail_tokens", imcTailTokens,
 			"elapsed", elapsed.String(),
 			"active_streams", remaining,
 		}
@@ -85,6 +101,12 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 		// due to a collapsed acceptance EMA). Models without a draft
 		// model omit the fields entirely.
 		if e.model.draft != nil {
+			switch {
+			case disableReason != "":
+				mtpResumeSource = "disabled"
+			case mtpResumeSource == "":
+				mtpResumeSource = "fresh-prefill"
+			}
 			var rate float64
 			if draftTokens > 0 {
 				rate = float64(draftAcceptedTokens) / float64(draftTokens)
@@ -98,6 +120,7 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 				"draft_accepted_tokens", draftAcceptedTokens,
 				"draft_acceptance_rate", fmt.Sprintf("%.2f", rate),
 				"draft_coverage", fmt.Sprintf("%.2f", coverage),
+				"draft_resume_source", mtpResumeSource,
 			)
 			if disableReason != "" {
 				args = append(args, "draft_disable_reason", disableReason)
@@ -149,8 +172,15 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 	// against this session's seqID.
 	if s.job.imcSession != nil {
 		e.model.cacheMu.Lock()
-		s.job.imcSession.seqID = imcSeqIDUnbound
+		// A newly published snapshot may already be serving another slot.
+		// Only unbind the sequence this request actually owned.
+		if s.job.imcSession.seqID == s.seqID {
+			s.job.imcSession.seqID = imcSeqIDUnbound
+		}
 		e.model.cacheMu.Unlock()
+	}
+	if s.job.hasIMCReservation() {
+		e.model.imcClearPending(s.job.imcSessionID)
 	}
 
 	// Handle error case.
@@ -179,7 +209,32 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 			usage.DraftAcceptanceRate = float64(usage.DraftAcceptedTokens) / float64(usage.DraftTokens)
 		}
 		if outputTokens > 0 && e.model.draft != nil {
-			usage.DraftCoverage = float64(s.specRounds+s.specAcceptedTotal) / float64(outputTokens)
+			usage.DraftCoverage = float64(s.specCoveredTotal) / float64(outputTokens)
+		}
+
+		status := "error"
+		class := "active-slot"
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || ctx.Err() != nil {
+			status = "cancel"
+			class = "context-cancelled"
+		}
+		s.span.RecordError(err)
+		s.span.SetAttributes(
+			attribute.String("request_status", status),
+			attribute.Int("prompt_tokens", s.nPrompt),
+			attribute.Int("reasoning_tokens", s.reasonTokens),
+			attribute.Int("completion_tokens", s.completionTokens),
+			attribute.Int("output_tokens", outputTokens),
+			attribute.Int("total_tokens", usage.TotalTokens),
+			attribute.Float64("tokens_per_second", tokensPerSecond),
+			attribute.Int("draft_tokens", s.specDraftedTotal),
+			attribute.Int("draft_accepted_tokens", s.specAcceptedTotal),
+			attribute.Int("draft_covered_tokens", s.specCoveredTotal),
+		)
+		metrics.AddChatRequest(e.model.modelInfo.ID, status)
+		metrics.AddChatError(e.model.modelInfo.ID, class)
+		if !s.job.requestStart.IsZero() {
+			metrics.ObserveChatRequestDuration(e.model.modelInfo.ID, time.Since(s.job.requestStart))
 		}
 
 		e.model.sendErrorResponse(ctx, s.job.ch, s.job.id, s.job.object, 0, "", err, usage)
@@ -273,7 +328,7 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 		usage.DraftAcceptanceRate = float64(usage.DraftAcceptedTokens) / float64(usage.DraftTokens)
 	}
 	if outputTokens > 0 && e.model.draft != nil {
-		usage.DraftCoverage = float64(s.specRounds+s.specAcceptedTotal) / float64(outputTokens)
+		usage.DraftCoverage = float64(s.specCoveredTotal) / float64(outputTokens)
 	}
 
 	// Add span attributes and end span.
@@ -286,6 +341,7 @@ func (e *batchEngine) finishSlot(s *slot, err error) {
 		attribute.Float64("tokens_per_second", tokensPerSecond),
 		attribute.Int("draft_tokens", s.specDraftedTotal),
 		attribute.Int("draft_accepted_tokens", s.specAcceptedTotal),
+		attribute.Int("draft_covered_tokens", s.specCoveredTotal),
 	)
 
 	// Add metrics.
@@ -312,7 +368,11 @@ func (e *batchEngine) failJob(job *chatJob, err error) {
 	e.model.sendErrorResponse(job.ctx, job.ch, job.id, job.object, 0, "", err, Usage{})
 
 	if job.queueWaitSpan != nil {
+		job.queueWaitSpan.RecordError(err)
 		job.queueWaitSpan.End()
+	}
+	if !job.queuedAt.IsZero() {
+		metrics.ObserveChatQueueWait(e.model.modelInfo.ID, time.Since(job.queuedAt))
 	}
 
 	status := "error"
@@ -328,7 +388,7 @@ func (e *batchEngine) failJob(job *chatJob, err error) {
 	}
 
 	// Clear IMC pending reservation if this job reserved a slot.
-	if job.imcCacheHit && (len(job.imcNewCacheTokens) > 0 || job.imcMediaBuild) {
+	if job.hasIMCReservation() {
 		e.model.imcClearPending(job.imcSessionID)
 	}
 
@@ -337,10 +397,12 @@ func (e *batchEngine) failJob(job *chatJob, err error) {
 	// where the next sequential request can hit ErrServerBusy while
 	// this stream's count is still in flight.
 	remaining := e.model.activeStreams.Add(-1)
+	metrics.AddPoolActiveStreams(e.model.modelInfo.ID, -1)
 	close(job.ch)
 
 	e.model.log(job.ctx, "batch-engine", "status", "job-failed", "id", job.id,
-		"imc_slot", job.imcSessionID, "imc_cache_hit", job.imcCacheHit,
+		"imc_slot", job.imcSessionID, "imc_active", job.imcCacheHit,
+		"imc_cache_hit", job.imcSnapshotReused,
 		"err", err, "active_streams", remaining)
 }
 
